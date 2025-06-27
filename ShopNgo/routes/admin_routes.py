@@ -1,6 +1,8 @@
 from flask import Blueprint, request, jsonify, current_app
 from bson import ObjectId
 from utils.jwt_utils import jwt_required
+from datetime import datetime, timedelta
+from collections import Counter
 
 admin_bp = Blueprint("admin", __name__)
 
@@ -133,3 +135,126 @@ def get_inventory():
         product["_id"] = str(product["_id"])
 
     return jsonify({"products": products}), 200
+
+
+# --- ADMIN ANALYTICS ENDPOINTS ---
+
+@admin_bp.route("/active_carts", methods=["GET"])
+@jwt_required
+def get_active_carts():
+    if request.user.get("role") != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    mongo = current_app.mongo
+    # Find all active sessions (carts in use)
+    active_sessions = list(mongo.db.sessions.find({"is_active": True}))
+    for session in active_sessions:
+        session["_id"] = str(session["_id"])
+        session["cart_id"] = str(session["cart_id"])
+        session["started_at"] = session["started_at"].isoformat() if "started_at" in session else None
+        session["updated_at"] = session["updated_at"].isoformat() if "updated_at" in session else None
+    return jsonify({"active_carts": active_sessions, "count": len(active_sessions)})
+
+@admin_bp.route("/orders", methods=["GET"])
+@jwt_required
+def get_all_orders():
+    if request.user.get("role") != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    mongo = current_app.mongo
+    orders = list(mongo.db.orders.find({}, sort=[("created_at", -1)]))
+    for order in orders:
+        order["_id"] = str(order["_id"])
+        order["created_at"] = order["created_at"].isoformat() if "created_at" in order else None
+        if "card_number" in order:
+            order["card_number"] = "****" + order["card_number"][-4:]
+    return jsonify({"orders": orders, "count": len(orders)})
+
+@admin_bp.route("/analytics/peak_hours", methods=["GET"])
+@jwt_required
+def get_peak_hours():
+    if request.user.get("role") != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    mongo = current_app.mongo
+    days = int(request.args.get("days", 30))
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=days)
+    orders = list(mongo.db.orders.find({"created_at": {"$gte": start_date, "$lte": end_date}}))
+    hours = [order["created_at"].hour for order in orders if "created_at" in order]
+    hour_counts = Counter(hours)
+    peak_hours = hour_counts.most_common(5)
+    return jsonify({"peak_hours": peak_hours, "total_orders": len(orders)})
+
+@admin_bp.route("/analytics/trending_products", methods=["GET"])
+@jwt_required
+def get_trending_products():
+    if request.user.get("role") != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    mongo = current_app.mongo
+    days = int(request.args.get("days", 30))
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=days)
+    orders = list(mongo.db.orders.find({"created_at": {"$gte": start_date, "$lte": end_date}}))
+    product_counter = Counter()
+    for order in orders:
+        for item in order.get("items", []):
+            product_counter[item["product_id"]] += item.get("quantity", 1)
+    top_products = product_counter.most_common(10)
+    # Get product details
+    products = []
+    for product_id, count in top_products:
+        product = mongo.db.products.find_one({"_id": ObjectId(product_id)})
+        if product:
+            products.append({
+                "product_id": str(product_id),
+                "name": product.get("name", "Unknown"),
+                "total_quantity": count
+            })
+    return jsonify({"trending_products": products})
+
+@admin_bp.route("/analytics/product_associations", methods=["GET"])
+@jwt_required
+def get_product_associations():
+    if request.user.get("role") != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    mongo = current_app.mongo
+    days = int(request.args.get("days", 30))
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=days)
+    orders = list(mongo.db.orders.find({"created_at": {"$gte": start_date, "$lte": end_date}}))
+    # Build baskets
+    baskets = [set(item["product_id"] for item in order.get("items", [])) for order in orders]
+    pair_counter = Counter()
+    for basket in baskets:
+        for a in basket:
+            for b in basket:
+                if a < b:
+                    pair_counter[(a, b)] += 1
+    top_pairs = pair_counter.most_common(10)
+    associations = []
+    for (a, b), count in top_pairs:
+        prod_a = mongo.db.products.find_one({"_id": ObjectId(a)})
+        prod_b = mongo.db.products.find_one({"_id": ObjectId(b)})
+        if prod_a and prod_b:
+            associations.append({
+                "product_a": {"id": str(a), "name": prod_a.get("name", "Unknown")},
+                "product_b": {"id": str(b), "name": prod_b.get("name", "Unknown")},
+                "count": count
+            })
+    return jsonify({"product_associations": associations})
+
+@admin_bp.route("/analytics/sales", methods=["GET"])
+@jwt_required
+def get_sales_analytics():
+    if request.user.get("role") != "admin":
+        return jsonify({"error": "Admin access required"}), 403
+    mongo = current_app.mongo
+    days = int(request.args.get("days", 30))
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=days)
+    orders = list(mongo.db.orders.find({"created_at": {"$gte": start_date, "$lte": end_date}}))
+    total_sales = sum(order.get("total_amount", 0) for order in orders)
+    total_products = sum(item.get("quantity", 1) for order in orders for item in order.get("items", []))
+    return jsonify({
+        "total_sales": total_sales,
+        "total_products_sold": total_products,
+        "order_count": len(orders)
+    })
